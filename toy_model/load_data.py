@@ -45,9 +45,10 @@ def load_data(n_neurons = 100,
               lognormal_noise = False,
               untuned_neurons = False,
 
+              clip_fr = False,
               centering = False,
               seed = 1,
-              
+
               batchsize=1):
 
     rng = np.random.default_rng(seed)
@@ -55,8 +56,8 @@ def load_data(n_neurons = 100,
     if phase == "2":
         amplitude_ur = amplitude_or
         
-    X_train, y_train, pref_train = generate_dataset(n_neurons, n_samples_train, p_over, amplitude_or, amplitude_ur, baseline, amplitude_untuned, noise_or, noise_ur, noise_bg, noise_independent, use_noise_model, multiplicative_noise, poisson_noise, lognormal_noise, untuned_neurons, seed1 = seed, seed2 = seed)
-    X_test, y_test, pref_test = generate_dataset(n_neurons, n_samples_test, p_over, amplitude_or, amplitude_ur, baseline, amplitude_untuned, noise_or, noise_ur, noise_bg, noise_independent, use_noise_model, multiplicative_noise, untuned_neurons, seed1 = seed, seed2 = 100+seed)
+    X_train, y_train, pref_train = generate_dataset(n_neurons, n_samples_train, p_over, amplitude_or, amplitude_ur, baseline, amplitude_untuned, noise_or, noise_ur, noise_bg, noise_independent, use_noise_model, multiplicative_noise, poisson_noise, lognormal_noise, untuned_neurons, clip_fr = clip_fr, seed1 = seed, seed2 = seed)
+    X_test, y_test, pref_test = generate_dataset(n_neurons, n_samples_test, p_over, amplitude_or, amplitude_ur, baseline, amplitude_untuned, noise_or, noise_ur, noise_bg, noise_independent, use_noise_model, multiplicative_noise, untuned_neurons, clip_fr = clip_fr, seed1 = seed, seed2 = 100+seed)
 
     #center or not data
     if centering:
@@ -99,6 +100,9 @@ def generate_dataset(
     noise_untuned=0.1,
     spikes=False, 
     dt=1.0, 
+
+    clip_fr = False,
+    
     seed1=0,
     seed2=0,
     n_trials_per_condition=0.5,
@@ -108,8 +112,10 @@ def generate_dataset(
     n_trials = int(n_trials_per_condition * n_samples)
 
     p_u = p_untuned if untuned_neurons else 0.0
-    pref_array = rng.choice([0, 1, 2], size=N,
-                            p=[p_u, (1 - p_u) * p_over, (1 - p_u) * (1 - p_over)])
+    n_u = int(round(p_u * N))
+    n_or = int(round((N - n_u) * p_over))
+    pref_array = rng.permutation(np.r_[np.zeros(n_u, int), np.ones(n_or, int),
+                                       np.full(N - n_u - n_or, 2)])
 
     means_g1 = np.array([amplitude_untuned, baseline + amplitude_or, baseline]) * dt
     means_g2 = np.array([amplitude_untuned, baseline, baseline + amplitude_ur]) * dt
@@ -152,6 +158,9 @@ def generate_dataset(
     X = np.r_[sample(r1), sample(r2)]
     y = np.r_[np.ones(n_trials), np.zeros(n_trials)]
 
+    if clip_fr:
+        X = np.clip(X, 0, None)
+        
     if (X<0).sum() > 0:
         raise ValueError("Firing rate cannot be negative.")
         

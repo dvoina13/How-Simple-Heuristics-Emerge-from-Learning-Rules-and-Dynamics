@@ -2,8 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-WEIGHTS_DIR = "results/Oja_new_model/"
-GD_WEIGHTS_DIR = "results/GD_new_model/"
+root = "/home/dvoina/myproj1/fast_and_slow_p1/different_learning_rules/toy_data/"
+WEIGHTS_DIR = root + "results/Oja_new_model/"
+GD_WEIGHTS_DIR = root + "results/GD_new_model/"
 
 
 # --------------------------------------------------------------------------- #
@@ -24,6 +25,7 @@ def _shuffle(features, y):
 def _init_weights(student_w_init, n_features):
     """Copy of the initial weights (the caller's tensor is never modified)."""
     if student_w_init is None:
+        print("take weights from here...:", student_w_init)
         return torch.randn(1, n_features) * 0.01
     return torch.as_tensor(student_w_init).float().clone()
 
@@ -118,14 +120,21 @@ def _weights_filename(params, phase, prefix="weights"):
         f"_phase{int(phase) - 1}{params['centering']}.pt"
     )
 
-
+def _wta_step(u1, u2, I1, I2, w_inh, dt_tau):
+    """One Euler step of two rectified units with mutual inhibition:
+        tau du1/dt = -u1 + [I1 - w_inh*u2]_+
+        tau du2/dt = -u2 + [I2 - w_inh*u1]_+
+    """
+    du1 = -u1 + max(I1 - w_inh * u2, 0.0)
+    du2 = -u2 + max(I2 - w_inh * u1, 0.0)
+    return u1 + dt_tau * du1, u2 + dt_tau * du2
 # --------------------------------------------------------------------------- #
 # Plain Hebbian
 # --------------------------------------------------------------------------- #
 
 def train_hebbian_unsupervised(features, y, student_w_init=None, add_bias=False,
                                phase="1", parameter_list=None,
-                               n_epochs=300, eta=1e-8, bias_lr_scale=1000,
+                               n_epochs=300, eta=1e-6, bias_lr_scale=1000,
                                normalize=True, window=100, verbose=True):
     """Train a single linear student with the plain Hebbian rule dw = eta * y * x.
 
@@ -233,8 +242,8 @@ def _sample_error(y_out, label, target, error_type, flip):
 
 
 def train_3factor_oja(features, y, student_w_init=None, add_bias=False,
-                      phase="1", parameter_list=None, error_type="squared",
-                      n_epochs=300, eta=1e-8, bias_lr_scale=1000, alpha=0.1,
+                      phase="1", parameter_list=None, error_type="binary",
+                      n_epochs=1000, eta=1e-8, bias_lr_scale=1000, alpha=0.1,
                       flip=False, window=100, verbose=True):
     """Oja's rule gated by a third factor: dw = eta * M * (y * x - y^2 * w).
 
@@ -265,6 +274,7 @@ def train_3factor_oja(features, y, student_w_init=None, add_bias=False,
     gain = 1 if phase == "2" else 0
 
     w = _load_or_init_weights(phase, parameter_list, student_w_init, features.shape[1])
+    
     w_shape = w.shape
     w = w.reshape(-1)
     b = 0.0
@@ -283,7 +293,7 @@ def train_3factor_oja(features, y, student_w_init=None, add_bias=False,
                 err = _sample_error(y_out, labels[i], targets[i], error_type, flip)
                 if err_bar is None:
                     err_bar = err
-                modulator = -(err - err_bar)
+                modulator = err_bar #-(err - err_bar)
                 err_bar = (1 - alpha) * err_bar + alpha * err
 
                 _oja_update(w, x, y_out, eta, modulator)
@@ -308,73 +318,200 @@ def _gain_from_latent(theta):
     """Map the latent phase to a gain in [0, 1]: 0 at theta=0, 1 at theta=pi."""
     return (1 - np.cos(theta)) / 2
 
-
 def train_oja_unsupervised_adler(features, y, student_w_init=None, add_bias=False,
-                                 phase="1", n_epochs=40, eta=1e-5, bias_lr_scale=1000,
-                                 alpha=0.1, beta=0.01, A=2.5, gamma=10.0,
-                                 phase3_bias=-1.2289, window=100, verbose=True):
-    """Oja's rule where the bias gain is driven by the running error rate.
+                                 phase="1", n_epochs=40, b_init=None,
+                                 eta_rel=0.5, bias_lr=None, alpha=0.02,
+                                 beta=0.01, gamma=10.0, e_switch=0.08,
+                                 n_hold=1000, verbose=False):
+    """Adler switch with rescaled parameters and a commitment period (n_hold).
 
-    The error rate is an exponential moving average (rate `alpha`) of per-sample
-    mistakes. The gain signal 1 - 2|error - 0.5| peaks when the student is at
-    chance, and drives a latent phase theta via
-        theta += beta * (gamma * gain_signal - A * sin(2 theta)),
-    whose stable points are theta=0 (gain 0) and theta=pi (gain 1).
-    For bistability, need gamma*s_ok < A < gamma*s_fail.
+    eta = eta_rel / E|x|^2.  A = 2*gamma*e_switch (switch when smoothed error >
+    e_switch; ~0.08 at noise 0.1, ~0.25 at noise 1.0).  bias_lr=None means 0.5
+    in phases 1-2 and 0.01 in phase 3: the slow bias in phase 3 gives the bad
+    centering that sends the gate back to summing.  Inputs must not be
+    pre-centered (load_data(centering=False)), or w can diverge to NaN.
 
-    Phase 3 starts at theta=pi (gain 1) with zero error and bias `phase3_bias`.
-
-    Returns (student_w, student_b, eta, acc_arr, gain_arr). If `add_bias` is
-    True, student_b is the learned bias; otherwise it is the centering heuristic.
+    Returns (student_w, student_b, eta, acc_arr, gain_arr).
     """
     phase = str(phase)
-    features, labels = _shuffle(features, y)
-    w = _init_weights(student_w_init, features.shape[1])
-    w_shape = w.shape
-    w = w.reshape(-1)
+    features = torch.as_tensor(features).float()
+    labels = torch.as_tensor(y).detach().cpu().numpy().flatten()
+    perm = np.random.permutation(features.shape[0])
+    features, labels = features[torch.from_numpy(perm)], labels[perm]
+    n_samples, n_total = features.shape
 
-    if phase == "3":
-        theta, error, b = np.pi, 0.0, phase3_bias
+    if student_w_init is None:
+        w = -torch.randn(n_total).abs() * 0.01
     else:
-        theta, error, b = 0.0, 0.0, 0.0
-    gain = _gain_from_latent(theta)
-    bias_lr = bias_lr_scale * eta
+        w = torch.as_tensor(student_w_init).float().clone().reshape(-1)
 
-    if verbose:
-        print("eta", eta, w.mean().item())
-        print("Student learning via Oja's Rule...")
+    if bias_lr is None:
+        bias_lr = 0.01 if phase == "3" else 0.5
+    b = float(b_init) if b_init is not None else -(features[:50] @ w).mean().item()
+    if features.mean(0).abs().max() < 1e-3 * features.abs().max():
+        warnings.warn("features look pre-centered; use load_data(centering=False), "
+                      "centered inputs can make the weights diverge.")
+
+    eta = eta_rel / (features ** 2).sum(1).mean().item()
+    A = 2 * gamma * e_switch
+    theta = np.pi if phase == "3" else 0.0
+    gain = (1 - np.cos(theta)) / 2
+    error, hold = 0.0, 0
 
     acc_arr, gain_arr = [], []
     with torch.no_grad():
         for _ in range(n_epochs):
-            outputs = []
-            for i, x in enumerate(features):
-                b, y_bar = _oja_bias_step(w, b, x, gain, eta, bias_lr)
-                outputs.append(y_bar)
+            y_arr = []
+            for i in range(n_samples):
+                x = features[i]
+                y_s = torch.dot(w, x).item() + gain * b
+                w += eta * (y_s * x - y_s ** 2 * w)
+                y_new = torch.dot(w, x).item() + b
+                b -= bias_lr * y_new
+                y_arr.append(y_new)
 
-                # Error-driven gain dynamics
-                mistake = float(_predict(y_bar, flip=True) != labels[i])
-                error = (1 - alpha) * error + alpha * mistake
+                pred = (1 - np.sign(y_new)) // 2              # output < 0 predicts 1
+                error = (1 - alpha) * error + alpha * float(pred != labels[i])
                 gain_signal = 1 - 2 * abs(error - 0.5)
-                theta += beta * (gamma * gain_signal - A * np.sin(2 * theta))
-                theta %= 2 * np.pi
-                gain = _gain_from_latent(theta)
+                drive = 0.0 if hold > 0 else gamma * gain_signal
+                hold = max(hold - 1, 0)
 
-                if i > 0 and i % window == 0:
-                    acc = _window_accuracy(outputs, labels, i, flip=True, window=window)
-                    acc_arr.append(acc)
+                theta = (theta + beta * (drive - A * np.sin(2 * theta))) % (2 * np.pi)
+                new_gain = (1 - np.cos(theta)) / 2
+                if (new_gain - 0.5) * (gain - 0.5) < 0:       # switched: commit
+                    hold = n_hold
+                gain = new_gain
+
+                if i > 0 and i % 100 == 0:
+                    p = (1 - np.sign(np.array(y_arr[i - 100:i]))) // 2
+                    acc_arr.append((p == labels[i - 100:i]).mean())
                     gain_arr.append(gain)
                     if verbose:
-                        print(f"i={i:5d}  acc={acc:.2f}  error={error:.3f}  "
-                              f"gain_signal={gain_signal:.3f}  theta={theta:.3f}  "
-                              f"gain={gain:.3f}  b={b:.4f}")
+                        print(f"i={i:4d} acc={acc_arr[-1]:.2f} error={error:.3f} "
+                              f"theta={theta:.2f} gain={gain:.2f} hold={hold}")
 
-    w = w.reshape(w_shape)
+    w = w.reshape(1, -1)
     if not add_bias:
-        b = _centering_bias(w, features)
+        b = -torch.mean(w @ features.T).item()
     return w, b, eta, acc_arr, gain_arr
 
 
+###############################
+# Oja with switch, 2 pathways #
+###############################
+
+def train_oja_switch(features, y, student_w_init=None, add_bias=False,
+                     init_state=None, n_epochs=40, eta_rel=0.5, bias_lr=0.5,
+                     alpha_err=0.05, alpha_pol=0.05, e_tol=0.2,
+                     w_inh=1.2, cost2=0.2, tau=20.0, u_init=(0.0, 0.0), eps=1e-6,
+                     window=100, verbose=True):
+    """Two Oja readouts learned in parallel, with a gate that switches between them.
+ 
+    Readouts (both unsupervised, same eta, same input):
+      y1 = w1.x + b1   uncentered Oja (gain=0). b1 tracks -mean(y1) but only
+                       sets the threshold; it never enters learning.
+                       -> summing heuristic under asymmetric representations.
+      y2 = w2.x + b2   centered Oja (gain=1): learns on y - y_mean.
+                       -> balanced heuristic.
+ 
+    Each readout's sign from Oja is arbitrary, so each has a polarity s_k in
+    {-1, +1}: the sign of an EMA (rate `alpha_pol`) of y_k * (2*label - 1).
+    Each readout makes its own prediction, and its running error e_k is an
+    EMA (rate `alpha_err`) of its own mistakes.
+ 
+    Gate: winner-take-all between two units with mutual inhibition,
+        tau du1/dt = -u1 + [I1 - w_inh*u2]_+
+        tau du2/dt = -u2 + [I2 - w_inh*u1]_+
+    (Euler steps of one trial; `tau` is in trials). Inputs are capped
+    above-chance accuracy,
+        I_k = clip(1 - 2*e_k, 0, 1 - 2*e_tol),
+    so I_k = 0 at chance and saturates once the error is below `e_tol`.
+    Gate and output:
+        g = u2 / (u1 + u2 + eps),   y = (1 - g) * s1*y1 + g * s2*y2.
+    - "Good enough": once both readouts are under e_tol their inputs are
+      equal, so the unit that is already active stays active (satisficing).
+    - Penalty on change: with w_inh > 1 the winner sits at u_k = I_k and the
+      loser is silent until I_j > w_inh * I_k. w_inh is the switching cost:
+      the challenger needs w_inh times the incumbent's evidence.
+    - Cost: y2's input is reduced by `cost2`. While both readouts are good
+      enough, y1 (summing) has the larger input, so it wins in phase 1 and takes
+      back over in phase 3. Windows (cap = 1 - 2*e_tol):
+        phase 2 switch to y2:  cost2 < cap - w_inh * I1   (I1 = summing's input there)
+        phase 3 return to y1:  cost2 > cap * (1 - 1/w_inh)
+      With w_inh = 1.2, cap = 0.6: roughly 0.1 < cost2 < 0.3. cost2 = 0 gives the
+      plain gate (no return to summing in phase 3; phase 1 decided by a race).
+ 
+    Timescales: y2 only behaves as centered Oja if b2 tracks the mean much
+    faster than w2 changes (bias_lr >> eta * lambda1). With bias_lr = 1000*eta
+    on the toy data the mean leaked into w2 and it never converged; 1e4*eta
+    worked. Re-check this ratio on your own data scale.
+ 
+    To carry state across phases, pass the returned `state` dict as
+    `init_state` of the next call (weights, biases, polarities, errors, u1, u2).
+ 
+    Returns (w1, b1, w2, b2, eta, acc_arr, gate_arr, err_arr, state), where
+    err_arr holds (e1, e2) per window. If `add_bias` is False, b1 and b2 are
+    replaced by the centering heuristic over the dataset.
+    """
+    features, labels = _shuffle(features, y)
+    n_features = features.shape[1]
+    st = dict(init_state or {})
+ 
+    w1 = _init_weights(st.get("w1", student_w_init), n_features).reshape(-1)
+    w2 = _init_weights(st.get("w2", w1.clone()), n_features).reshape(-1)
+    b1, b2 = st.get("b1", 0.0), st.get("b2", 0.0)
+    c1, c2 = st.get("c1", 0.0), st.get("c2", 0.0)      # polarity EMAs
+    e1, e2 = st.get("e1", 0.5), st.get("e2", 0.5)      # error EMAs, start at chance
+    u1, u2 = st.get("u1", u_init[0]), st.get("u2", u_init[1])
+    g = u2 / (u1 + u2 + eps)
+    I_cap = 1 - 2 * e_tol
+    dt_tau = 1.0 / tau
+    eta = eta_rel / (features ** 2).sum(1).mean().item()   # scale-free learning rate
+ 
+    acc_arr, gate_arr, err_arr = [], [], []
+    with torch.no_grad():
+        for _ in range(n_epochs):
+            correct = []
+            for i, x in enumerate(features):
+                lab = labels[i]
+                b1, y1 = _oja_bias_step(w1, b1, x, 0, eta, bias_lr)
+                b2, y2 = _oja_bias_step(w2, b2, x, 1, eta, bias_lr)
+ 
+                # Polarity of each readout (which side is class 1)
+                t = 2 * lab - 1
+                c1 = (1 - alpha_pol) * c1 + alpha_pol * y1 * t
+                c2 = (1 - alpha_pol) * c2 + alpha_pol * y2 * t
+                s1, s2 = (1.0 if c1 >= 0 else -1.0), (1.0 if c2 >= 0 else -1.0)
+ 
+                # Each readout's own error
+                e1 = (1 - alpha_err) * e1 + alpha_err * float((s1 * y1 > 0) != lab)
+                e2 = (1 - alpha_err) * e2 + alpha_err * float((s2 * y2 > 0) != lab)
+ 
+                # Combined output and its accuracy
+                y_out = (1 - g) * s1 * y1 + g * s2 * y2
+                correct.append(float((y_out > 0) == lab))
+ 
+                # Winner-take-all gate on capped above-chance accuracy
+                I1 = min(max(1 - 2 * e1, 0.0), I_cap)
+                I2 = min(max(1 - 2 * e2, 0.0), I_cap) - cost2   # cost of the balanced pathway
+                u1, u2 = _wta_step(u1, u2, I1, I2, w_inh, dt_tau)
+                g = u2 / (u1 + u2 + eps)
+ 
+                if i > 0 and i % window == 0:
+                    acc = np.mean(correct[i - window:i])
+                    acc_arr.append(acc)
+                    gate_arr.append(g)
+                    err_arr.append((e1, e2))
+                    if verbose:
+                        print(f"i={i:5d}  acc={acc:.2f}  e1={e1:.3f}  e2={e2:.3f}  "
+                              f"u1={u1:.3f}  u2={u2:.3f}  g={g:.3f}")
+ 
+    state = dict(w1=w1.clone(), w2=w2.clone(), b1=b1, b2=b2, c1=c1, c2=c2,
+                 e1=e1, e2=e2, u1=u1, u2=u2)
+    if not add_bias:
+        b1, b2 = _centering_bias(w1, features), _centering_bias(w2, features)
+    return w1, b1, w2, b2, eta, acc_arr, gate_arr, err_arr, state
+    
 # --------------------------------------------------------------------------- #
 # Gradient-descent baseline (trains an nn.Linear-style network)
 # --------------------------------------------------------------------------- #

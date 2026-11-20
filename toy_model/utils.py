@@ -18,7 +18,7 @@ from scipy import stats
 
 import argparse
 
-from tb_logger import TBLogger
+#from tb_logger import TBLogger
 import warnings
 ############ compute CP, noise correlations, and readout weights #################
 
